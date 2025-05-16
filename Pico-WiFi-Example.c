@@ -8,9 +8,9 @@
    Pico-WiFi-Example.c
    St-Louys Andre - October 2024
    astlouys@gmail.com
-   Revision 14-OCT-2024
+   Revision 06-JAN-2025
    Langage: C with arm-none-eabi
-   Version 2.00
+   Version 2.02
 
    Raspberry Pi Pico Firmware to test the Pico-WiFi-Driver library.
    This firmware doesn't do much useful thing, but it shows how to implement
@@ -28,13 +28,16 @@
 
    REVISION HISTORY:
    =================
-               1.00 - Original release from Raspberry Pi Ltd.
-   03-OCT-2024 2.00 - Adapted to Pico-WiFi-Driver by Andre St-Louys.
+   03-OCT-2024 1.00 - Original release from Raspberry Pi Ltd..
+   03-OCT-2024 2.00 - Adapted by Andre St-Louys as an "add-in module" to facilitate the addition of Wi-Fi to an existing project.
+   06-JAN-2025 2.01 - Add a way to monitor Wi-Fi network health and implement a callback to do it.
+                    - Other minor and cosmetic changes.
+   14-MAY-2025 2.02 - Cleanup, cosmetic and optimization changes.
 \* ============================================================================================================================================================= */
 
 
-/* $TITLE=Include files. */
 /* $PAGE */
+/* $TITLE=Include files. */
 /* ============================================================================================================================================================= *\
                                                                           Include files
 \* ============================================================================================================================================================= */
@@ -47,6 +50,7 @@
 #include "pico/stdlib.h"
 #include "Pico-WiFi-Module.h"
 #include "ping.h"
+#include "stdarg.h"
 #include <stdio.h>
 
 
@@ -78,7 +82,7 @@ struct
   UCHAR NetworkName[40];
 }WlanFound[MAX_NETWORKS];
 
-struct struct_wifi StructWiFi;
+struct repeating_timer Handle5SecTimer;
 
 
 
@@ -87,11 +91,20 @@ struct struct_wifi StructWiFi;
 /* ============================================================================================================================================================= *\
                                                                      Function prototypes.
 \* ============================================================================================================================================================= */
-/* Read a string from stdin. */
+/* Callback in charge of Wi-Fi network monitoring. */
+bool callback_5sec_timer(struct repeating_timer *t);
+
+/* Retrieve Pico's Unique ID from the flash IC. */
+void get_pico_unique_id(UCHAR *PicoUniqueId);
+
+/* Read data from stdin. */
 void input_string(UCHAR *String);
 
+/* Log data to log file. */
+void log_info(UINT LineNumber, const UCHAR *FunctionName, UCHAR *Format, ...);
+
 /* Logon to local network. */
-void network_logon(void);
+void network_logon(struct struct_wifi *StructWiFi);
 
 /* Print results of the scan process. */
 void print_results(UINT8 SortOrder);
@@ -109,7 +122,7 @@ static int scan_results(void *env, const cyw43_ev_scan_result_t *result);
 void sort_results(UINT8 SortOrder);
 
 /* Terminal menu when a CDC USB connection is detected during power up sequence. */
-void term_menu(void);
+void term_menu(struct struct_wifi *StructWiFi);
 
 /* Wipe results. */
 void wipe_results(void);
@@ -125,6 +138,7 @@ void wipe_results(void);
 int main()
 {
   UCHAR String[65];
+  UCHAR PicoUniqueId[25];
 
   INT16 ReturnCode;
 
@@ -132,6 +146,8 @@ int main()
   UINT8 FlagScanning;
 
   UINT16 Loop1UInt16;
+
+  struct struct_wifi StructWiFi;
 
   absolute_time_t ScanTime;
 
@@ -146,8 +162,8 @@ int main()
   StructWiFi.CountryCode = COUNTRY_CODE;
   stdio_init_all();
 
-  strcpy(StructWiFi.NetworkName,     WIFI_SSID);
-  strcpy(StructWiFi.NetworkPassword, WIFI_PASSWORD);
+  strcpy(StructWiFi.NetworkName,     WIFI_SSID);      // network name is read from environment variable (see User Guide).
+  strcpy(StructWiFi.NetworkPassword, WIFI_PASSWORD);  // password is read from environment variable (see User Guide).
 
 
 
@@ -166,28 +182,38 @@ int main()
     ++Delay;  // one more 1-second cycle waiting for CDC USB connection.
     wifi_blink(250, 250, 1);
 
-    /* If we waited for more than 60 seconds for a CDC USB connection, get out of the loop and continue. */
+    /* If we waited for more than 120 seconds for a CDC USB connection, get out of the loop and continue. */
     if (Delay > 120) break;
   }
 
+  get_pico_unique_id(PicoUniqueId);
+
+  log_info(__LINE__, __func__, "==============================================================================================================\r");
+  log_info(__LINE__, __func__, "                                              Pico-WiFi-Example\r");
+  log_info(__LINE__, __func__, "                                    Part of the ASTL Smart Home ecosystem.\r");
+  log_info(__LINE__, __func__, "                                    Pico unique ID: <%s>.\r", PicoUniqueId);
+  log_info(__LINE__, __func__, "==============================================================================================================\r");
+  log_info(__LINE__, __func__, "Main program entry point (Delay: %u msec waiting for CDC USB connection).\r", (Delay * 50));
+
+
 
   /* Check if CDC USB connection has been detected.*/
-  if (stdio_usb_connected()) printf("[%5u] - CDC USB connection has been detected.\r", __LINE__);
+  if (stdio_usb_connected()) log_info(__LINE__, __func__, "CDC USB connection has been detected.\r", __LINE__);
 
 
-  if (wifi_cyw43_init(&StructWiFi))
+  if (wifi_init(&StructWiFi))
   {
-    printf("[%5u] - Failed to initialize cyw43\r", __LINE__);
+    log_info(__LINE__, __func__, "Failed to initialize cyw43\r");
     return 1;
   }
   else
   {
-    printf("[%5u] - Cyw43 initialization successful.\r", __LINE__);
+    log_info(__LINE__, __func__, "Cyw43 initialization successful.\r");
   }
   
 
   /* Set station mode. */
-  printf("[%5u] - Setting station mode\r\r\r", __LINE__);
+  log_info(__LINE__, __func__, "Setting station mode\r\r\r");
   cyw43_arch_enable_sta_mode();
   
 
@@ -196,10 +222,77 @@ int main()
   \* --------------------------------------------------------------------------------------------------------------------------- */
   while (1)
   {
-    term_menu();
+    term_menu(&StructWiFi);
   }
 
   return 0;
+}
+
+
+
+
+
+/* $TITLE=callback_5sec_timer() */
+/* $PAGE */
+/* ============================================================================================================================================================= *\
+                                                          Callback in charge of monitoring Wi-Fi network health.
+\* ============================================================================================================================================================= */
+bool callback_5sec_timer(struct repeating_timer *t)
+{
+  INT ReturnCode;
+
+  UINT16 Loop1UInt16;
+
+  static UINT64 TimeStamp;
+
+
+  if (TimeStamp == 0ll) TimeStamp = time_us_64();  // keep track of callback launch.
+
+  ReturnCode = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+  if (ReturnCode == CYW43_LINK_UP)
+  {
+    // log_info(__LINE__, __func__, "time_us_64(): %12llu     TimeStamp: %12llu     TimeStamp + (30 * 1000000): %12llu\r", time_us_64(), TimeStamp, (TimeStamp + (30 * 1000000)));
+    if (time_us_64() < (TimeStamp + (15 * 1000000))) log_info(__LINE__, __func__, "Wi-Fi connection OK.\r");
+    wifi_blink(50, 200, 1);
+  }
+  else
+  {
+    if (time_us_64() < (TimeStamp + (15 * 1000000))) log_info(__LINE__, __func__, "Problems with Wi-Fi connection...\r");
+    wifi_blink(50, 200, 3);
+  }
+
+  return true;
+}
+
+
+
+
+
+/* $PAGE */
+/* $TITLE=get_pico_unique_id() */
+/* ============================================================================================================================================================= *\
+                                                           Retrieve Pico's Unique ID from the flash IC.
+\* ============================================================================================================================================================= */
+void get_pico_unique_id(UCHAR *PicoUniqueId)
+{
+  UINT8 Loop1UInt8;
+
+  pico_unique_board_id_t board_id;
+
+
+  /* Retrieve Pico Unique ID from its flash memory IC. */
+  pico_get_unique_board_id(&board_id);
+
+  /* Build the Unique ID string in hex. */
+  PicoUniqueId[0] = 0x00;  // initialize as null string on entry.
+  for (Loop1UInt8 = 0; Loop1UInt8 < PICO_UNIQUE_BOARD_ID_SIZE_BYTES; ++Loop1UInt8)
+  {
+    // log_info(__LINE__, __func__, "%2u - 0x%2.2X\r", Loop1UInt8, board_id.id[Loop1UInt8]);
+    sprintf(&PicoUniqueId[strlen(PicoUniqueId)], "%2.2X", board_id.id[Loop1UInt8]);
+    if ((Loop1UInt8 % 2) && (Loop1UInt8 != 7)) sprintf(&PicoUniqueId[strlen(PicoUniqueId)], "-");
+  }
+
+  return;
 }
 
 
@@ -310,11 +403,85 @@ void input_string(UCHAR *String)
 
 
 /* $PAGE */
+/* $TITLE=log_info()) */
+/* ============================================================================================================================================================= *\
+                                                            Log info to log file through Pico UART or CDC USB.
+\* ============================================================================================================================================================= */
+void log_info(UINT LineNumber, const UCHAR *FunctionName, UCHAR *Format, ...)
+{
+  UCHAR Dum1Str[256];
+  UCHAR TimeStamp[128];
+
+  UINT Loop1UInt;
+  UINT StartChar;
+
+  va_list argp;
+
+
+  /* Transfer the text to print to variable Dum1Str */
+  va_start(argp, Format);
+  vsnprintf(Dum1Str, sizeof(Dum1Str), Format, argp);
+  va_end(argp);
+
+  /* Trap special control code for <HOME>. Replace "home" by appropriate control characters for "Home" on a VT101. */
+  if (strcmp(Dum1Str, "home") == 0)
+  {
+    Dum1Str[0] = 0x1B; // ESC code
+    Dum1Str[1] = '[';
+    Dum1Str[2] = 'H';
+    Dum1Str[3] = 0x00;
+  }
+
+  /* Trap special control code for <CLS>. Replace "cls" by appropriate control characters for "Clear screen" on a VT101. */
+  if (strcmp(Dum1Str, "cls") == 0)
+  {
+    Dum1Str[0] = 0x1B; // ESC code
+    Dum1Str[1] = '[';
+    Dum1Str[2] = '2';
+    Dum1Str[3] = 'J';
+    Dum1Str[4] = 0x00;
+  }
+
+  /* Time stamp will not be printed if first character is a '-' (for title line when starting debug, for example),
+     or if first character is a line feed '\r' when we simply want add line spacing in the debug log,
+     or if first character is the beginning of a control stream (for example 'Home' or "Clear screen'). */
+  if ((Dum1Str[0] != '-') && (Dum1Str[0] != '\r') && (Dum1Str[0] != 0x1B) && (Dum1Str[0] != '|'))
+  {
+    /* Send line number through UART. */
+    printf("[%7u] - ", LineNumber);
+
+    /* Display function name. */
+    printf("[%s]", FunctionName);
+    for (Loop1UInt = strlen(FunctionName); Loop1UInt < 25; ++Loop1UInt)
+    {
+      printf(" ");
+    }
+    printf("- ");
+
+
+    /* Retrieve current time stamp. */
+    // date_stamp(TimeStamp);
+
+    /* Send time stamp through UART. */
+    // printf(TimeStamp);
+  }
+
+  /* Send string through stdout. */
+  printf(Dum1Str);
+
+  return;
+}
+
+
+
+
+
+/* $PAGE */
 /* $TITLE=network_logon(). */
 /* ============================================================================================================================================================= *\
                                                                    Logon to local network.
 \* ============================================================================================================================================================= */
-void network_logon(void)
+void network_logon(struct struct_wifi *StructWiFi)
 {
   UCHAR String[65];
 
@@ -324,19 +491,19 @@ void network_logon(void)
   /* --------------------------------------------------------------------------------------------------------------------------- *\
                                        Give an opportunity for user to change network nanme (SSID).
   \* --------------------------------------------------------------------------------------------------------------------------- */
-  printf("[%5u] - Current network name is <%s>\r", __LINE__, StructWiFi.NetworkName);
-  printf("[%5u] - Enter new network name or <Enter> to keep current one: ", __LINE__);
+  log_info(__LINE__, __func__, "Current network name is <%s>\r", StructWiFi->NetworkName);
+  log_info(__LINE__, __func__, "Enter new network name or <Enter> to keep current one: ");
   input_string(String);
   if ((String[0] != 0x0D) && (String[0] != 0x1B))
   {
-    strcpy(StructWiFi.NetworkName, String);
-    printf("[%5u] - Network name has been changed to: <%s>.\r", __LINE__, StructWiFi.NetworkName);
+    strcpy(StructWiFi->NetworkName, String);
+    log_info(__LINE__, __func__, "Network name has been changed to: <%s>.\r", StructWiFi->NetworkName);
   }
   else
   {
-    printf("[%5u] - Network name has not been changed: <%s>.\r", __LINE__, StructWiFi.NetworkName);
+    log_info(__LINE__, __func__, "Network name has not been changed: <%s>.\r", StructWiFi->NetworkName);
   }
-  printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+  log_info(__LINE__, __func__, "Press <Enter> to continue: ");
   input_string(String);
 
 
@@ -345,19 +512,19 @@ void network_logon(void)
                                       Give an opportunity for user to change network password.
   \* --------------------------------------------------------------------------------------------------------------------------- */
   printf("\r\r");
-  printf("[%5u] - Current network password is <%s>\r", __LINE__, StructWiFi.NetworkPassword);
-  printf("[%5u] - Enter new network password or <Enter> to keep current one: ", __LINE__);
+  log_info(__LINE__, __func__, "Current network password is <%s>\r", StructWiFi->NetworkPassword);
+  log_info(__LINE__, __func__, "Enter new network password or <Enter> to keep current one: ");
   input_string(String);
   if ((String[0] != 0x0D) && (String[0] != 0x1B))
   {
-    strcpy(StructWiFi.NetworkPassword, String);
-    printf("[%5u] - Network password has been changed to: <%s>.\r", __LINE__, StructWiFi.NetworkPassword);
+    strcpy(StructWiFi->NetworkPassword, String);
+    log_info(__LINE__, __func__, "Network password has been changed to: <%s>.\r", StructWiFi->NetworkPassword);
   }
   else
   {
-    printf("[%5u] - Network password has not been changed: <%s>.\r", __LINE__, StructWiFi.NetworkPassword);
+    log_info(__LINE__, __func__, "Network password has not been changed: <%s>.\r", StructWiFi->NetworkPassword);
   }
-  printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+  log_info(__LINE__, __func__, "Press <Enter> to continue: ", __LINE__);
   input_string(String);
 
 
@@ -366,13 +533,13 @@ void network_logon(void)
                                                      Establish WiFi connection.
   \* --------------------------------------------------------------------------------------------------------------------------- */
   printf("\r\r");
-  printf("[%5u] - Trying to establish Wi-Fi connection.\r", __LINE__);
-  if ((ReturnCode = wifi_init_connection(&StructWiFi)) != 0)
+  log_info(__LINE__, __func__, "Trying to establish Wi-Fi connection.\r");
+  if ((ReturnCode = wifi_connect(StructWiFi)) != 0)
   {
-    printf("[%5u] - Error while trying to establish a Wi-Fi connection (ReturnCode: %d).\r", __LINE__, ReturnCode);
-    printf("[%5u] - Aborting Firmware...\r", __LINE__);
+    log_info(__LINE__, __func__, "Error while trying to establish a Wi-Fi connection (ReturnCode: %d).\r", ReturnCode);
+    log_info(__LINE__, __func__, "Aborting Firmware...\r");
   }
-  printf("[%5u] - Wi-Fi connection established successfully.\r", __LINE__);
+  log_info(__LINE__, __func__, "Wi-Fi connection established successfully.\r");
   FlagLogon = FLAG_ON;
 
   return;
@@ -394,29 +561,29 @@ void print_results(UINT8 SortOrder)
 
 
   /* Display  header. */
-  printf("     ==================================================================================================================================\r");
-  printf("                                                       Results of Access Points scan.\r");
+  log_info(__LINE__, __func__, "==================================================================================================================================\r");
+  log_info(__LINE__, __func__, "                                                  Results of Access Points scan.\r");
 
   switch (SortOrder)
   {
     case (1):
-      printf("                                          Listed in the order they were scanned (Channel order).\r");
+      log_info(__LINE__, __func__, "                                             Listed in the order they were scanned.\r");
     break;
   
     case (2):
-      printf("                                              Results have been sorted by MAC address order.\r");
+      log_info(__LINE__, __func__, "                                         Results have been sorted by MAC address order.\r");
     break;
   }
 
-  printf("     ==================================================================================================================================\r\r");
-  printf("              Network                        Signal    Channel       MAC             ------------------   Security   ------------------\r");
-  printf("               name                         strength               address\r");
-  printf("     ==================================================================================================================================\r");
+  log_info(__LINE__, __func__, "==================================================================================================================================\r");
+  log_info(__LINE__, __func__, "         Network                        Signal    Channel       MAC             ------------------   Security   ------------------\r");
+  log_info(__LINE__, __func__, "          name                         strength               address\r");
+  log_info(__LINE__, __func__, "==================================================================================================================================\r");
 
   for (Loop1UInt16 = 1; WlanFound[Loop1UInt16].Channel; ++Loop1UInt16)
     print_single_entry(Loop1UInt16);
 
-  printf("     ==================================================================================================================================\r\r\r");
+  log_info(__LINE__, __func__, "==================================================================================================================================\r\r\r");
 
   return;
 }
@@ -435,7 +602,7 @@ void print_single_entry(UINT16 EntryNumber)
   UINT16 Loop1UInt16;
 
 
-  printf("     %3u)   %-32s  %4d      %3ld   ", EntryNumber, WlanFound[EntryNumber].NetworkName, WlanFound[EntryNumber].SignalStrength, WlanFound[EntryNumber].Channel);
+  log_info(__LINE__, __func__, "%3u)   %-32s  %4d      %3ld   ", EntryNumber, WlanFound[EntryNumber].NetworkName, WlanFound[EntryNumber].SignalStrength, WlanFound[EntryNumber].Channel);
 
   for (Loop1UInt16 = 0; Loop1UInt16 < 6; ++Loop1UInt16)
   {
@@ -537,7 +704,7 @@ static int scan_results(void *env, const cyw43_ev_scan_result_t *Result)
 
   if (Result)
   {
-    printf("     %2u)   %-32s   %4d      %3ld   %02X:%02X:%02X:%02X:%02X:%02X     %u     \r",
+    log_info(__LINE__, __func__, "%2u)   %-32s   %4d      %3ld   %02X:%02X:%02X:%02X:%02X:%02X     %u     \r",
            APNumber,
            Result->ssid, Result->rssi, Result->channel,
            Result->bssid[0], Result->bssid[1], Result->bssid[2], Result->bssid[3], Result->bssid[4], Result->bssid[5],
@@ -622,7 +789,6 @@ static int scan_results(void *env, const cyw43_ev_scan_result_t *Result)
 void scan_wifi(void)
 {
   UCHAR *Dum1Ptr;
-  UCHAR  String[65];
 
   INT16 ReturnCode;
 
@@ -635,31 +801,31 @@ void scan_wifi(void)
 
 
   /* Wipe WlanFound structure on entry. */
-  printf("[%5u] - sizeof(WlanFound): %u\r", __LINE__, sizeof(WlanFound));
+  log_info(__LINE__, __func__, "sizeof(WlanFound): %u\r", sizeof(WlanFound));
   Dum1Ptr = (UCHAR *)&WlanFound[0];
   for (Loop1UInt16 = 0; Loop1UInt16 < sizeof(WlanFound); ++Loop1UInt16)
     Dum1Ptr = '\0';
 
 
   /* Scan Wi-Fi frequency to find available Access Points. */
-  printf("     ========================================================================================\r");
-  printf("                       Scan Wi-Fi spectrum to find available Access Points.\r");
-  printf("                      Listed in the order they were scanned (Channel order).\r");
-  printf("                    Using frequencies used in the following country: %c%c Rev: %u\r", COUNTRY_CODE, (COUNTRY_CODE >> 8), (COUNTRY_CODE >> 16));
-  printf("     ========================================================================================\r");
-  printf("              Network                        Signal    Channel       MAC        Security\r");
-  printf("               name                         strength               address\r");
-  printf("     ========================================================================================\r");
+  log_info(__LINE__, __func__, "========================================================================================\r");
+  log_info(__LINE__, __func__, "                  Scan Wi-Fi spectrum to find available Access Points.\r");
+  log_info(__LINE__, __func__, "                         Listed in the order they were scanned.\r");
+  log_info(__LINE__, __func__, "               Using frequencies used in the following country: %c%c Rev: %u\r", COUNTRY_CODE, (COUNTRY_CODE >> 8), (COUNTRY_CODE >> 16));
+  log_info(__LINE__, __func__, "========================================================================================\r");
+  log_info(__LINE__, __func__, "         Network                        Signal    Channel       MAC        Security\r");
+  log_info(__LINE__, __func__, "          name                         strength               address\r");
+  log_info(__LINE__, __func__, "========================================================================================\r");
 
   ReturnCode   = cyw43_wifi_scan(&cyw43_state, &ScanOptions, NULL, scan_results);
   if (ReturnCode != 0)
   {
-    printf("[%5u] - Error while trying to scan Wi-Fi spectrum...\r");
+    log_info(__LINE__, __func__, "Error while trying to scan Wi-Fi spectrum...\r");
   }
   else
   {
     while (cyw43_wifi_scan_active(&cyw43_state) == true);  // wait until the scan is over...
-    printf("     ========================================================================================\r\r\r\r");
+    log_info(__LINE__, __func__, "========================================================================================\r\r\r\r");
   }
 
 
@@ -701,7 +867,7 @@ void sort_results(UINT8 SortOrder)
   UINT8  MacPosition;
 
 
-  // printf("[%5u] - Entering sort_results().\r", __LINE__);
+  // log_info(__LINE__, __func__, "Entering sort_results().\r");
 
   switch (SortOrder)
   {
@@ -730,7 +896,7 @@ void sort_results(UINT8 SortOrder)
     break;
   }
 
-  // printf("[%5u] - Exiting sort_results().\r", __LINE__);
+  // log_info(__LINE__, __func__, "Exiting sort_results().\r");
 
   return;
 }
@@ -743,7 +909,7 @@ void sort_results(UINT8 SortOrder)
 /* ============================================================================================================================================================= *\
                                           Terminal menu when a CDC USB connection is detected during power up sequence.
 \* ============================================================================================================================================================= */
-void term_menu(void)
+void term_menu(struct struct_wifi *StructWiFi)
 {
   UCHAR String[33];
 
@@ -757,17 +923,19 @@ void term_menu(void)
   while (1)
   {
     printf("\r\r\r");
-    printf("                         Terminal menu\r\r");
-    printf("               1) - Scan Wi-Fi frequencies for available Access Points.\r");
-    printf("               2) - Logon to local network.\r");
-    printf("               3) - Display Wi-Fi network information.\r");
-    printf("               4) - Blink Picow's LED.\r");
-    printf("               5) - Re-initialize cyw43.\r");
-    printf("               6) - Ping a specific IP address.\r");
-    printf("               7) - Restart the Firmware.\r");
-    printf("               8) - Switch Pico in upload mode\r\r");
+    log_info(__LINE__, __func__, "               Terminal menu\r");
+    log_info(__LINE__, __func__, "               =============\r");
+    log_info(__LINE__, __func__, "          1) - Scan Wi-Fi frequencies for available Access Points.\r");
+    log_info(__LINE__, __func__, "          2) - Logon to local network.\r");
+    log_info(__LINE__, __func__, "          3) - Display Wi-Fi network information.\r");
+    log_info(__LINE__, __func__, "          4) - Blink Picow's LED.\r");
+    log_info(__LINE__, __func__, "          5) - Re-initialize cyw43.\r");
+    log_info(__LINE__, __func__, "          6) - Ping a specific IP address.\r");
+    log_info(__LINE__, __func__, "          7) - Start a callback to monitor Wi-Fi network health.\r");
+    log_info(__LINE__, __func__, "         88) - Restart the Firmware.\r");
+    log_info(__LINE__, __func__, "         99) - Switch Pico in upload mode\r\r");
 
-    printf("                       Enter your choice: ");
+    log_info(__LINE__, __func__, "               Enter your choice: ");
     input_string(String);
 
     /* If user pressed <Enter> only, loop back to menu. */
@@ -791,16 +959,16 @@ void term_menu(void)
        case (1):
         /* Scan Wi-Fi frequencies of specified country to find avaible Access Points. */
         printf("\r\r");
-        printf("[%5u] - NOTE: For some obscur reason, the scan must be done just after cyw43 initialization.\r",        __LINE__);
-        printf("[%5u] -       Some results will not be reported on further reports once network login has been done\r", __LINE__);
-        printf("[%5u] -       You can select the menu option to re-initialize the cyw43.\r", __LINE__);
-        printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+        log_info(__LINE__, __func__, "NOTE: For some obscur reason, the scan must be done just after cyw43 initialization.\r");
+        log_info(__LINE__, __func__, "      Some results will not be reported on further reports once network login has been done\r");
+        log_info(__LINE__, __func__, "      You can select the menu option to re-initialize the cyw43.\r");
+        log_info(__LINE__, __func__, "Press <Enter> to continue: ");
         input_string(String);
 
-        printf("[%5u] - Scan Wi-Fi frequencies to find available Access Points.\r",   __LINE__);
-        printf("[%5u] - =======================================================\r\r", __LINE__);
+        log_info(__LINE__, __func__, "Scan Wi-Fi frequencies to find available Access Points.\r");
+        log_info(__LINE__, __func__, "=======================================================\r\r");
         scan_wifi();
-        printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+        log_info(__LINE__, __func__, "Press <Enter> to continue: ");
         input_string(String);
         printf("\r\r");
       break;
@@ -808,11 +976,11 @@ void term_menu(void)
       case (2):
         /* Logon to local network using credentials specified in environmental variables. */
         printf("\r\r");
-        printf("[%5u] - Logon to local network.\r",   __LINE__);
-        printf("[%5u] - =======================\r", __LINE__);
-        network_logon();
-        wifi_display_info(&StructWiFi);
-        printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+        log_info(__LINE__, __func__, "Logon to local network.\r");
+        log_info(__LINE__, __func__, "=======================\r");
+        network_logon(StructWiFi);
+        wifi_display_info(StructWiFi);
+        log_info(__LINE__, __func__, "Press <Enter> to continue: ");
         input_string(String);
         printf("\r\r");
       break;
@@ -820,25 +988,25 @@ void term_menu(void)
       case (3):
         /* Display Wi-Fi network information. */
         printf("\r\r");
-        printf("[%5u] - Display Wi-Fi network information.\r",   __LINE__);
-        printf("[%5u] - ==================================\r", __LINE__);
+        log_info(__LINE__, __func__, "Display Wi-Fi network information.\r");
+        log_info(__LINE__, __func__, "==================================\r");
         if (FlagLogon == FLAG_OFF)
         {
-          printf("[%5u] - NOTE: Logon to local network has not been done yet.\r", __LINE__);
-          printf("[%5u] -       Network information will be wrong / incomplete.\r", __LINE__);
+          log_info(__LINE__, __func__, "NOTE: Logon to local network has not been done yet.\r");
+          log_info(__LINE__, __func__, "      Network information will be wrong / incomplete.\r");
         }
-        wifi_display_info(&StructWiFi);
-        printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+        wifi_display_info(StructWiFi);
+        log_info(__LINE__, __func__, "Press <Enter> to continue: ");
         input_string(String);
         printf("\r\r");
       break;
 
       case (4):
         printf("\r\r");
-        printf("[%5u] - Blink PicoW's LED.\r",   __LINE__);
-        printf("[%5u] - ==================\r", __LINE__);
+        log_info(__LINE__, __func__, "Blink PicoW's LED.\r");
+        log_info(__LINE__, __func__, "==================\r");
         wifi_blink(100, 200, 10);
-        printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+        log_info(__LINE__, __func__, "Press <Enter> to continue: ");
         input_string(String);
         printf("\r\r");
       break;
@@ -846,33 +1014,33 @@ void term_menu(void)
       case (5):
         /* Re-init cyw43. */
         printf("\r\r");
-        printf("[%5u] - Re-init cyw43.\r",   __LINE__);
-        printf("[%5u] - ==============\r", __LINE__);
-        printf("[%5u] - Press <G> to proceed: ",    __LINE__);
+        log_info(__LINE__, __func__, "Re-init cyw43.\r");
+        log_info(__LINE__, __func__, "==============\r");
+        log_info(__LINE__, __func__, "Press <G> to proceed: ");
         input_string(String);
         if ((String[0] == 'G') || (String[0] == 'g'))
         {
           cyw43_arch_deinit();
-          printf("[%5u] - Re-initializing cyw43...\r", __LINE__);
-          if (wifi_cyw43_init(&StructWiFi))
+          log_info(__LINE__, __func__, "Re-initializing cyw43...\r");
+          if (wifi_init(StructWiFi))
           {
-            printf("[%5u] - Failed to initialize cyw43\r", __LINE__);
+            log_info(__LINE__, __func__, "Failed to initialize cyw43\r");
             return;
           }
           else
           {
-            printf("[%5u] - Cyw43 initialization successful.\r", __LINE__);
+            log_info(__LINE__, __func__, "Cyw43 initialization successful.\r");
           }
           
           /* Set station mode. */
-          printf("[%5u] - Setting station mode\r\r\r", __LINE__);
+          log_info(__LINE__, __func__, "Setting station mode\r\r\r");
           cyw43_arch_enable_sta_mode();
         }
         else
         {
-          printf("[%5u] - User didn't press <G>. Cyw43 hasn't been re-initialized.\r", __LINE__);
+          log_info(__LINE__, __func__, "User didn't press <G>. Cyw43 hasn't been re-initialized.\r");
         }
-        printf("[%5u] - Press <Enter> to continue: ", __LINE__);
+        log_info(__LINE__, __func__, "Press <Enter> to continue: ");
         input_string(String);
         printf("\r\r");
       break;
@@ -880,78 +1048,112 @@ void term_menu(void)
       case (6):
         /* Ping a apecific IP address. */
         printf("\r\r");
-        printf("[%5u] - Ping a specific IP address.\r",   __LINE__);
-        printf("[%5u] - ===========================\r", __LINE__);
+        log_info(__LINE__, __func__, "Ping a specific IP address.\r");
+        log_info(__LINE__, __func__, "===========================\r");
 
         /* Enter IP address to ping. */
         ip4addr_aton(PING_ADDRESS, &PingAddress);
-        printf("[%5u] - Current IP address to ping is:   <%s>\r", __LINE__, ip4addr_ntoa(&PingAddress));
-        printf("[%5u] - Enter new IP address to ping or <Enter> to keep current IP address: ", __LINE__);
+        log_info(__LINE__, __func__, "Current IP address to ping is:   <%s>\r", ip4addr_ntoa(&PingAddress));
+        log_info(__LINE__, __func__, "Enter new IP address to ping or <Enter> to keep current target IP address: ");
         input_string(String);
         if ((String[0] != 0x0D) && (String[0] != 0x1B))
         {
           if (!ip4addr_aton(String, &TestAddress))
           {
-            printf("[%5u] - Invalid IP address entered... IP address has not been changed: <%s>.\r", __LINE__, ip4addr_ntoa(&PingAddress));
+            log_info(__LINE__, __func__, "Invalid IP address entered... IP address has not been changed: <%s>.\r", ip4addr_ntoa(&PingAddress));
           }
           else
           {
             ip4addr_aton(String, &PingAddress);
-            printf("[%5u] - Ping IP address has been set to: <%s>\r", __LINE__, ip4addr_ntoa(&PingAddress));
+            log_info(__LINE__, __func__, "Ping IP address has been set to: <%s>\r", ip4addr_ntoa(&PingAddress));
           }
         }
         else
         {
-          printf("[%5u] - No change to ping IP address: <%s>.\r", __LINE__, ip4addr_ntoa(&PingAddress));
+          log_info(__LINE__, __func__, "No change to ping IP address: <%s>.\r", ip4addr_ntoa(&PingAddress));
         }
 
-        printf("[%5u] - Press <G> to ping IP address: %s\r",   __LINE__, ip4addr_ntoa(&PingAddress));
-        printf("[%5u] - Press any key while pinging is in progress to stop it and restart the firmware: ", __LINE__);
+        printf("\r");
+        log_info(__LINE__, __func__, "NOTE: You must be logged on the local network (option 2) for the ping procedure to work.\r\r");
+        log_info(__LINE__, __func__, "The Pico will ping the specified IP address on local network.\r");
+        log_info(__LINE__, __func__, "If the target IP address is a 'pingable' system, you will see the ping sent and the answer\r");
+        log_info(__LINE__, __func__, "received from the target system, along with the number of msec (latency) between the send and the receive.\r");
+        log_info(__LINE__, __func__, "Press any key while ping is in progress to stop it and restart the firmware\r");
+        log_info(__LINE__, __func__, "Press <G> to begin pinging IP address %s: ", ip4addr_ntoa(&PingAddress));
         input_string(String);
         if ((String[0] == 'G') || (String[0] == 'g'))
         {
-          printf("[%5u] - Press any key to restart the firmware...\r", __LINE__);
+          log_info(__LINE__, __func__, "Press any key to restart the firmware...\r");
           ping_init(&PingAddress);
         }
         else
         {
-          printf("[%5u] - User didn't press <G> to start ping procedure... aborting.\r", __LINE__);
+          log_info(__LINE__, __func__, "User didn't press <G> to start ping procedure... aborting.\r");
           break;
         }
         input_string(String);
         cyw43_arch_deinit();
-        printf("[%5u] - Restarting the Firmware...\r", __LINE__);
+        log_info(__LINE__, __func__, "Restarting the Firmware...\r");
         sleep_ms(1000);
         watchdog_enable(1, 1);
       break;
 
       case (7):
+        /* Start a callback to monitor Wi-Fi network health. */
+        printf("\r\r");
+        log_info(__LINE__, __func__, "Start a 5-seconds callback to monitor Wi-Fi network health.\r");
+        log_info(__LINE__, __func__, "===========================================================\r");
+        log_info(__LINE__, __func__, "NOTE: The callback will display Wi-Fi network health for the first 30 seconds,\r");
+        log_info(__LINE__, __func__, "      then will stop display network health but will continue monitoring.\r");
+        log_info(__LINE__, __func__, "      The callback will blink Pico's LED as long as monitoring is active.\r");
+        log_info(__LINE__, __func__, "Press <G> to proceed: ");
+        input_string(String);
+        if ((String[0] == 'G') || (String[0] == 'g'))
+        {
+          log_info(__LINE__, __func__, "Starting a 5-seconds callback to monitor Wi-Fi network health.\r");
+          log_info(__LINE__, __func__, "NOTE: For the first 30 seconds, a message will show up on the screen to indicate Wi-Fi connection health.\r");
+          log_info(__LINE__, __func__, "      Then, you must check Pico's LED:\r");
+          log_info(__LINE__, __func__, "      1 blink  every 5 seconds means that Wi-Fi connection is OK.\r");
+          log_info(__LINE__, __func__, "      3 blinks every 5 seconds means that there is a problem with Wi-Fi connection.\r");
+          sleep_ms(500);  ///
+          add_repeating_timer_ms(-5000, callback_5sec_timer, NULL, &Handle5SecTimer);
+          sleep_ms(20000);
+        }
+        else
+        {
+          log_info(__LINE__, __func__, "User didn't press <G>, do not launch the callback...\r");
+        }
+        log_info(__LINE__, __func__, "Returning to terminal menu... Check Pico's LED for Wi-Fi status.\r");
+        printf("\r\r");
+      break;
+
+      case (88):
         /* Restart the Firmware. */
         printf("\r\r");
-        printf("[%5u] - Restart the Firmware.\r",   __LINE__);
-        printf("[%5u] - =====================\r", __LINE__);
-        printf("[%5u] - Press <G> to proceed: ",    __LINE__);
+        log_info(__LINE__, __func__, "Restart the Firmware.\r");
+        log_info(__LINE__, __func__, "=====================\r");
+        log_info(__LINE__, __func__, "Press <G> to proceed: ");
         input_string(String);
         if ((String[0] == 'G') || (String[0] == 'g'))
         {
           cyw43_arch_deinit();
-          printf("[%5u] - Restarting the Firmware...\r", __LINE__);
+          log_info(__LINE__, __func__, "Restarting the Firmware...\r");
           watchdog_enable(1, 1);
         }
         sleep_ms(3000);  // prevent beginning of menu redisplay.
       break;
 
-      case (8):
+      case (99):
         /* Switch the Pico in upload mode. */
         printf("\r\r");
-        printf("[%5u] - Switch Pico in upload mode.\r",   __LINE__);
-        printf("[%5u] - ===========================\r", __LINE__);
-        printf("[%5u] - Press <G> to proceed: ",          __LINE__);
+        log_info(__LINE__, __func__, "Switch Pico in upload mode.\r");
+        log_info(__LINE__, __func__, "===========================\r");
+        log_info(__LINE__, __func__, "Press <G> to proceed: ");
         input_string(String);
         if ((String[0] == 'G') || (String[0] == 'g'))
         {
           cyw43_arch_deinit();
-          printf("[%5u] - Toggling the Pico in upload mode...\r", __LINE__);
+          log_info(__LINE__, __func__, "Toggling Pico in upload mode...\r");
           reset_usb_boot(0l, 0l);
         }
         printf("\r\r");
@@ -959,7 +1161,7 @@ void term_menu(void)
 
       default:
         printf("\r\r");
-        printf("                    Invalid choice... please re-enter [%s]  [%u]\r\r\r\r\r", String, Menu);
+        log_info(__LINE__, __func__, "               Invalid choice... please re-enter [%s]  [%u]\r\r\r\r\r", String, Menu);
         printf("\r\r");
       break;
     }

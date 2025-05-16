@@ -22,8 +22,9 @@ typedef uint64_t      UINT64;
 #define FLAG_OFF     0x00
 #define FLAG_ON      0x01
 
-#define FALSE        0
-#define TRUE         1
+#define FALSE           0
+#define TRUE            1
 
+#define PICO_LED_PIN   25
 #endif  // _BASELINE_H_
 

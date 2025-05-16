@@ -24,7 +24,7 @@ set(PICO_BOARD pico_w CACHE STRING "Board type")
 include(pico_sdk_import.cmake)
 #
 #
-# Specify the project name.
+# Specify project name.
 project(Pico-WiFi-Example)
 #
 #
@@ -55,9 +55,11 @@ if (PICO_CYW43_SUPPORTED) # set by BOARD=pico-w
     if ("${WIFI_SSID}" STREQUAL "")
       message("Environment variable WIFI_SSID (network name) is not defined... aborting build process.")
       message("(edit your .bashrc file to add the WIFI_SSID environment variable or modify the CMakeLists.txt file to define it there.")
+      return()
     elseif ("${WIFI_PASSWORD}" STREQUAL "")
       message("Environment variable WIFI_PASSWORD (network password) is not defined... aborting build process.")
       message("(edit your .bashrc file to add the WIFI_PASSWORD environment variable or modify the CMakeLists.txt file to define it there.")
+      return()
     else()
       #
       add_executable(
